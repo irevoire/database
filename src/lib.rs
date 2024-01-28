@@ -5,7 +5,8 @@ mod error;
 use std::{
     collections::BTreeMap,
     fs::File,
-    io::{self, Read, Seek, SeekFrom, Write},
+    io::{self, BufReader, Read, Seek, SeekFrom, Write},
+    mem,
     path::{Path, PathBuf},
 };
 
@@ -27,17 +28,52 @@ impl Database {
         let dir = dir.as_ref();
         std::fs::create_dir_all(dir)?;
 
-        let dirty = File::options()
+        let mut dirty = File::options()
             .write(true)
             .read(true)
             .create(true)
-            .open(dir.join("0"))?;
+            .open(dir.join("dirty"))?;
 
         Ok(Database {
             path: dir.to_owned(),
-            memtable: BTreeMap::new(),
+            memtable: Self::init_memtable(&mut dirty)?,
             dirty,
         })
+    }
+
+    fn init_memtable(dirty: &mut File) -> Result<BTreeMap<Vec<u8>, usize>> {
+        let mut memtable = BTreeMap::new();
+        let mut reader = BufReader::new(dirty);
+
+        let mut current_position = 0;
+        let mut key_buf = Vec::new();
+
+        loop {
+            let key_size = match read_u32(&mut reader) {
+                Ok(size) => size as usize,
+                // We went through the whole dirty entries, we can stop
+                Err(err) if err.kind() == io::ErrorKind::UnexpectedEof => break,
+                Err(e) => {
+                    println!("{e}");
+                    return Err(e.into());
+                }
+            };
+
+            read_bytes(&mut reader, key_size, &mut key_buf)?;
+            memtable.insert(key_buf.clone(), current_position);
+
+            let value_size = read_u32(&mut reader)? as usize;
+            io::copy(
+                &mut reader.by_ref().take(value_size as u64),
+                &mut io::sink(),
+            )?;
+
+            // increase the current position by the size of the entry
+            // aka: the size _of the size_ of the key and value + the size of the key + the size of the value
+            current_position += mem::size_of::<u32>() * 2 + key_size + value_size;
+        }
+
+        Ok(memtable)
     }
 
     pub fn add(&mut self, key: impl AsRef<[u8]>, value: impl AsRef<[u8]>) -> Result<()> {
@@ -74,8 +110,6 @@ impl Database {
                     return Err(e.into());
                 }
             };
-
-            println!("1 size {size}");
 
             // If the size are the same we must check the if the values are the same as well
             if size == key.len() {
