@@ -19,7 +19,7 @@ pub struct Database {
     path: PathBuf,
 
     // An in memory `BTreeMap` of all the keys + their index in the current dirty segment
-    memtable: BTreeMap<Vec<u8>, usize>,
+    memtable: BTreeMap<Vec<u8>, u64>,
     dirty: File,
 }
 
@@ -41,7 +41,7 @@ impl Database {
         })
     }
 
-    fn init_memtable(dirty: &mut File) -> Result<BTreeMap<Vec<u8>, usize>> {
+    fn init_memtable(dirty: &mut File) -> Result<BTreeMap<Vec<u8>, u64>> {
         let mut memtable = BTreeMap::new();
         let mut reader = BufReader::new(dirty);
 
@@ -50,7 +50,7 @@ impl Database {
 
         loop {
             let key_size = match read_u32(&mut reader) {
-                Ok(size) => size as usize,
+                Ok(size) => size,
                 // We went through the whole dirty entries, we can stop
                 Err(err) if err.kind() == io::ErrorKind::UnexpectedEof => break,
                 Err(e) => {
@@ -59,10 +59,10 @@ impl Database {
                 }
             };
 
-            read_bytes(&mut reader, key_size, &mut key_buf)?;
+            read_bytes(&mut reader, key_size as usize, &mut key_buf)?;
             memtable.insert(key_buf.clone(), current_position);
 
-            let value_size = read_u32(&mut reader)? as usize;
+            let value_size = read_u32(&mut reader)?;
             io::copy(
                 &mut reader.by_ref().take(value_size as u64),
                 &mut io::sink(),
@@ -70,7 +70,8 @@ impl Database {
 
             // increase the current position by the size of the entry
             // aka: the size _of the size_ of the key and value + the size of the key + the size of the value
-            current_position += mem::size_of::<u32>() * 2 + key_size + value_size;
+            current_position +=
+                mem::size_of::<u32>() as u64 * 2 + key_size as u64 + value_size as u64;
         }
 
         Ok(memtable)
@@ -87,11 +88,17 @@ impl Database {
         }
 
         self.prepare_to_add()?;
+        let pos = self.dirty.stream_position()?;
 
+        // First we need to write everything on disk in case a crash happens
         self.dirty.write_all(&(key.len() as u32).to_be_bytes())?;
         self.dirty.write_all(key)?;
         self.dirty.write_all(&(value.len() as u32).to_be_bytes())?;
         self.dirty.write_all(value)?;
+
+        // Then we can add it in the memtable
+        self.memtable.insert(key.to_vec(), pos);
+
         Ok(())
     }
 
@@ -204,7 +211,7 @@ mod test {
         database.add(b"hello", b"world").unwrap();
         insta::assert_display_snapshot!(database.dump().unwrap(), @r###"
         memtable:
-        {}
+        {[104, 101, 108, 108, 111]: 0}
         dirty segment:
         [0, 0, 0, 5, 104, 101, 108, 108, 111, 0, 0, 0, 5, 119, 111, 114, 108, 100]
         "###);
