@@ -104,42 +104,17 @@ impl Database {
 
     pub fn get(&mut self, key: impl AsRef<[u8]>) -> Result<Option<Vec<u8>>> {
         let key = key.as_ref();
-        self.prepare_to_read()?;
-        let mut key_buf = Vec::new();
+        let index = match self.memtable.get(key) {
+            Some(index) => *index,
+            None => return Ok(None),
+        };
+        self.dirty.seek(SeekFrom::Start(index))?;
+        // skip the key
+        skip_entry(&mut self.dirty)?;
+        // and get the value
+        let value = read_entry_to_vec(&mut self.dirty)?;
 
-        loop {
-            let size = match read_u32(&mut self.dirty) {
-                Ok(size) => size as usize,
-                // we didn't find the element even thought we went through the whole segment
-                Err(err) if err.kind() == io::ErrorKind::UnexpectedEof => return Ok(None),
-                Err(e) => {
-                    println!("{e}");
-                    return Err(e.into());
-                }
-            };
-
-            // If the size are the same we must check the if the values are the same as well
-            if size == key.len() {
-                read_bytes(&mut self.dirty, size, &mut key_buf)?;
-
-                // we found the right value
-                if key == key_buf {
-                    // we'll re-use the key buffer to return the value
-                    read_entry(&mut self.dirty, &mut key_buf)?;
-                    return Ok(Some(key_buf));
-                } else {
-                    // We didn't find the value, we can move to the start of the next one
-                    self.dirty.seek(SeekFrom::Current(size as i64))?;
-                    skip_entry(&mut self.dirty)?;
-                }
-            } else {
-                println!("at index {size}");
-                // We the key doesn't match, we can move to the start of the next one
-                self.dirty.seek(SeekFrom::Current(size as i64))?;
-                // We must then skip the value
-                skip_entry(&mut self.dirty)?;
-            }
-        }
+        Ok(Some(value))
     }
 
     fn prepare_to_add(&mut self) -> io::Result<()> {
@@ -166,14 +141,18 @@ impl Database {
     }
 }
 
-/// Use the buffer provided to read your key and return the value in a
 fn read_entry(reader: &mut impl Read, buf: &mut Vec<u8>) -> io::Result<()> {
     let size = read_u32(reader)?;
     read_bytes(reader, size as usize, buf)?;
     Ok(())
 }
 
-/// Use the buffer provided to read your key and return the value in a
+fn read_entry_to_vec(reader: &mut impl Read) -> io::Result<Vec<u8>> {
+    let mut buf = Vec::new();
+    read_entry(reader, &mut buf)?;
+    Ok(buf)
+}
+
 fn read_bytes(reader: &mut impl Read, size: usize, buf: &mut Vec<u8>) -> io::Result<()> {
     buf.reserve(size);
     unsafe {
@@ -184,7 +163,6 @@ fn read_bytes(reader: &mut impl Read, size: usize, buf: &mut Vec<u8>) -> io::Res
     Ok(())
 }
 
-/// Use the buffer provided to read your key and return the value in a
 fn skip_entry(reader: &mut impl Read) -> io::Result<()> {
     let size = read_u32(reader)?;
     // we can't Seek thus we're throw away everything we've read
