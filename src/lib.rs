@@ -5,22 +5,27 @@ mod error;
 use std::{
     collections::BTreeMap,
     fs::File,
-    io::{self, BufReader, Read, Seek, SeekFrom, Write},
+    io::{self, BufReader, BufWriter, Read, Seek, SeekFrom, Write},
     mem,
     path::{Path, PathBuf},
 };
 
 pub use error::Error;
+use tempfile::{tempfile, NamedTempFile};
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
 pub struct Database {
+    /// When reached, rewrite the dirty segment as a clean segment
+    dirty_thresholds: usize,
+
     // The path that holds all the segments
     path: PathBuf,
 
     // An in memory `BTreeMap` of all the keys + their index in the current dirty segment
     memtable: BTreeMap<Vec<u8>, u64>,
     dirty: File,
+    segments: Vec<File>,
 }
 
 impl Database {
@@ -35,10 +40,16 @@ impl Database {
             .open(dir.join("dirty"))?;
 
         Ok(Database {
+            dirty_thresholds: 1024,
             path: dir.to_owned(),
             memtable: Self::init_memtable(&mut dirty)?,
             dirty,
+            segments: Vec::new(),
         })
+    }
+
+    pub fn dirty_thresholds(&mut self, threshold: usize) {
+        self.dirty_thresholds = threshold;
     }
 
     fn init_memtable(dirty: &mut File) -> Result<BTreeMap<Vec<u8>, u64>> {
@@ -91,13 +102,39 @@ impl Database {
         let pos = self.dirty.stream_position()?;
 
         // First we need to write everything on disk in case a crash happens
-        self.dirty.write_all(&(key.len() as u32).to_be_bytes())?;
-        self.dirty.write_all(key)?;
-        self.dirty.write_all(&(value.len() as u32).to_be_bytes())?;
-        self.dirty.write_all(value)?;
-
+        write_entry(&mut self.dirty, key, value)?;
         // Then we can add it in the memtable
         self.memtable.insert(key.to_vec(), pos);
+
+        if self.memtable.len() > self.dirty_thresholds {
+            // We need to dump the dirty entries in a new segment
+
+            // 1. Get a tempfile that'll be droped if something happens during the dumping operation
+            let new_segment = NamedTempFile::new_in(&self.path)?;
+            let mut writer = BufWriter::new(new_segment);
+
+            // 1. Write all entries ordered by keys in a new file
+            for (key, value) in self.memtable.iter() {
+                self.dirty.seek(SeekFrom::Start(
+                    value + mem::size_of::<u32>() as u64 + key.len() as u64,
+                ))?;
+                let value = read_entry_to_vec(&mut self.dirty)?;
+
+                write_entry(&mut writer, key, &value)?;
+            }
+            writer.flush()?;
+
+            // 2. Clean the dirty segment
+            self.memtable.clear();
+            let new_segment = writer
+                .into_inner()
+                .unwrap()
+                .persist(self.path.join("segment-1"))?;
+            self.dirty.set_len(0)?;
+
+            // 3. Push the new file to the segment list
+            self.segments.push(new_segment);
+        }
 
         Ok(())
     }
@@ -106,15 +143,47 @@ impl Database {
         let key = key.as_ref();
         let index = match self.memtable.get(key) {
             Some(index) => *index,
-            None => return Ok(None),
+            None => return self.get_from_segments(key),
         };
-        self.dirty.seek(SeekFrom::Start(index))?;
-        // skip the key
-        skip_entry(&mut self.dirty)?;
+        self.dirty.seek(SeekFrom::Start(
+            // the index + skip the key
+            index + mem::size_of::<u32>() as u64 + key.len() as u64,
+        ))?;
         // and get the value
         let value = read_entry_to_vec(&mut self.dirty)?;
 
         Ok(Some(value))
+    }
+
+    fn get_from_segments(&mut self, key: &[u8]) -> Result<Option<Vec<u8>>> {
+        let mut buf = Vec::new();
+        // We want to go from the most recent segment to the most outdated one
+        for segment in self.segments.iter_mut().rev() {
+            segment.seek(SeekFrom::Start(0))?;
+            let mut reader = BufReader::new(segment);
+
+            loop {
+                buf.clear();
+                match read_entry(&mut reader, &mut buf) {
+                    Ok(_) => (),
+                    // We went through the whole dirty entries, we can move to the next segment
+                    Err(err) if err.kind() == io::ErrorKind::UnexpectedEof => break,
+                    Err(e) => {
+                        println!("{e}");
+                        return Err(e.into());
+                    }
+                };
+                if key == buf {
+                    // we found the entry
+                    read_entry(&mut reader, &mut buf)?;
+                    return Ok(Some(buf));
+                } else {
+                    skip_entry(&mut reader)?;
+                }
+            }
+        }
+
+        Ok(None)
     }
 
     fn prepare_to_add(&mut self) -> io::Result<()> {
@@ -135,10 +204,25 @@ impl Database {
         self.prepare_to_read()?;
         self.dirty.read_to_end(&mut dirty_buf)?;
 
-        buf.push_str(&format!("dirty segment:\n{dirty_buf:?}"));
+        buf.push_str(&format!("dirty segment:\n{dirty_buf:?}\n"));
+
+        for (i, segment) in self.segments.iter_mut().enumerate() {
+            segment.seek(SeekFrom::Start(0))?;
+            dirty_buf.clear();
+            segment.read_to_end(&mut dirty_buf)?;
+            buf.push_str(&format!("segment {i}:\n{dirty_buf:?}\n"));
+        }
 
         Ok(buf)
     }
+}
+
+fn write_entry(mut writer: impl Write, key: &[u8], value: &[u8]) -> io::Result<()> {
+    writer.write_all(&(key.len() as u32).to_be_bytes())?;
+    writer.write_all(key)?;
+    writer.write_all(&(value.len() as u32).to_be_bytes())?;
+    writer.write_all(value)?;
+    Ok(())
 }
 
 fn read_entry(reader: &mut impl Read, buf: &mut Vec<u8>) -> io::Result<()> {
@@ -198,6 +282,40 @@ mod test {
         assert_eq!(v.as_deref(), Some(&b"world"[..]));
         let v = database.get(b"hemlo").map_err(|e| println!("{e}")).unwrap();
         assert_eq!(v.as_deref(), None);
+        assert_eq!(v.as_deref(), None);
+    }
+
+    #[test]
+    fn create_and_get_in_clean_segment() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut database = Database::new(dir.path()).unwrap();
+        database.dirty_thresholds(2);
+
+        database.add(b"hello", b"world").unwrap();
+        insta::assert_display_snapshot!(database.dump().unwrap(), @r###"
+        memtable:
+        {[104, 101, 108, 108, 111]: 0}
+        dirty segment:
+        [0, 0, 0, 5, 104, 101, 108, 108, 111, 0, 0, 0, 5, 119, 111, 114, 108, 100]
+        "###);
+        database.add(b"tamo", b"world").unwrap();
+        insta::assert_display_snapshot!(database.dump().unwrap(), @r###"
+        memtable:
+        {[104, 101, 108, 108, 111]: 0, [116, 97, 109, 111]: 18}
+        dirty segment:
+        [0, 0, 0, 5, 104, 101, 108, 108, 111, 0, 0, 0, 5, 119, 111, 114, 108, 100, 0, 0, 0, 4, 116, 97, 109, 111, 0, 0, 0, 5, 119, 111, 114, 108, 100]
+        "###);
+        database.add(b"patou", b"world").unwrap();
+        insta::assert_display_snapshot!(database.dump().unwrap(), @r###"
+        memtable:
+        {}
+        dirty segment:
+        []
+        segment 0:
+        [0, 0, 0, 5, 104, 101, 108, 108, 111, 0, 0, 0, 5, 119, 111, 114, 108, 100, 0, 0, 0, 5, 112, 97, 116, 111, 117, 0, 0, 0, 5, 119, 111, 114, 108, 100, 0, 0, 0, 4, 116, 97, 109, 111, 0, 0, 0, 5, 119, 111, 114, 108, 100]
+        "###);
+        let v = database.get(b"hello").map_err(|e| println!("{e}")).unwrap();
+        assert_eq!(v.as_deref(), Some(&b"world"[..]));
     }
 
     #[test]

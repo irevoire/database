@@ -10,6 +10,12 @@ pub enum Error {
         source: io::Error,
         backtrace: Backtrace,
     },
+    #[error("{source}: {backtrace}")]
+    TempFile {
+        #[from]
+        source: tempfile::PersistError,
+        backtrace: Backtrace,
+    },
     #[error("Key too large {0}. Maximum size accepted is {}", u32::MAX)]
     KeyTooLarge(usize),
 
