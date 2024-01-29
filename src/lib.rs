@@ -145,10 +145,16 @@ impl Database {
         Ok(())
     }
 
-    fn dump(&mut self) -> io::Result<Vec<u8>> {
+    fn dump(&mut self) -> io::Result<String> {
+        let mut buf = String::new();
+        buf.push_str(&format!("memtable:\n{:?}\n", self.memtable));
+
+        let mut dirty_buf = Vec::new();
         self.prepare_to_read()?;
-        let mut buf = Vec::new();
-        self.dirty.read_to_end(&mut buf)?;
+        self.dirty.read_to_end(&mut dirty_buf)?;
+
+        buf.push_str(&format!("dirty segment:\n{dirty_buf:?}"));
+
         Ok(buf)
     }
 }
@@ -196,32 +202,35 @@ mod test {
         let mut database = Database::new(dir.path()).unwrap();
 
         database.add(b"hello", b"world").unwrap();
-        insta::assert_debug_snapshot!(database.dump().unwrap(), @r###"
-        [
-            0,
-            0,
-            0,
-            5,
-            104,
-            101,
-            108,
-            108,
-            111,
-            0,
-            0,
-            0,
-            5,
-            119,
-            111,
-            114,
-            108,
-            100,
-        ]
+        insta::assert_display_snapshot!(database.dump().unwrap(), @r###"
+        memtable:
+        {}
+        dirty segment:
+        [0, 0, 0, 5, 104, 101, 108, 108, 111, 0, 0, 0, 5, 119, 111, 114, 108, 100]
         "###);
 
         let v = database.get(b"hello").map_err(|e| println!("{e}")).unwrap();
         assert_eq!(v.as_deref(), Some(&b"world"[..]));
         let v = database.get(b"hemlo").map_err(|e| println!("{e}")).unwrap();
         assert_eq!(v.as_deref(), None);
+    }
+
+    #[test]
+    fn reload_memtable() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut database = Database::new(dir.path()).unwrap();
+
+        database.add(b"hello", b"world").unwrap();
+        database.add(b"tamo", b"world").unwrap();
+
+        drop(database);
+        // dropping the previous database and opening a new one in the same dir
+        let mut database = Database::new(dir.path()).unwrap();
+        insta::assert_display_snapshot!(database.dump().unwrap(), @r###"
+        memtable:
+        {[104, 101, 108, 108, 111]: 0, [116, 97, 109, 111]: 18}
+        dirty segment:
+        [0, 0, 0, 5, 104, 101, 108, 108, 111, 0, 0, 0, 5, 119, 111, 114, 108, 100, 0, 0, 0, 4, 116, 97, 109, 111, 0, 0, 0, 5, 119, 111, 114, 108, 100]
+        "###);
     }
 }
