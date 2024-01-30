@@ -25,7 +25,48 @@ pub struct Database {
     // An in memory `BTreeMap` of all the keys + their index in the current dirty segment
     memtable: BTreeMap<Vec<u8>, u64>,
     dirty: File,
-    segments: Vec<File>,
+    segments: Vec<Segment>,
+}
+
+struct Segment {
+    file: File,
+}
+
+impl Segment {
+    pub fn get(&mut self, key: &[u8], buf: &mut Vec<u8>) -> Result<Option<Vec<u8>>> {
+        self.file.seek(SeekFrom::Start(0))?;
+        let mut reader = BufReader::new(&mut self.file);
+
+        loop {
+            buf.clear();
+            match read_entry(&mut reader, buf) {
+                Ok(_) => (),
+                // We went through the whole dirty entries, we can move to the next segment
+                Err(err) if err.kind() == io::ErrorKind::UnexpectedEof => break,
+                Err(e) => {
+                    println!("{e}");
+                    return Err(e.into());
+                }
+            };
+            if key == buf {
+                // we found the entry
+                read_entry(&mut reader, buf)?;
+                return Ok(Some(buf.to_vec()));
+            } else {
+                skip_entry(&mut reader)?;
+            }
+        }
+
+        Ok(None)
+    }
+
+    pub fn dump(&mut self, buf: &mut Vec<u8>) -> io::Result<()> {
+        buf.clear();
+        self.file.seek(SeekFrom::Start(0))?;
+        let mut reader = BufReader::new(&mut self.file);
+        reader.read_to_end(buf)?;
+        Ok(())
+    }
 }
 
 impl Database {
@@ -133,7 +174,7 @@ impl Database {
             self.dirty.set_len(0)?;
 
             // 3. Push the new file to the segment list
-            self.segments.push(new_segment);
+            self.segments.push(Segment { file: new_segment });
         }
 
         Ok(())
@@ -159,27 +200,8 @@ impl Database {
         let mut buf = Vec::new();
         // We want to go from the most recent segment to the most outdated one
         for segment in self.segments.iter_mut().rev() {
-            segment.seek(SeekFrom::Start(0))?;
-            let mut reader = BufReader::new(segment);
-
-            loop {
-                buf.clear();
-                match read_entry(&mut reader, &mut buf) {
-                    Ok(_) => (),
-                    // We went through the whole dirty entries, we can move to the next segment
-                    Err(err) if err.kind() == io::ErrorKind::UnexpectedEof => break,
-                    Err(e) => {
-                        println!("{e}");
-                        return Err(e.into());
-                    }
-                };
-                if key == buf {
-                    // we found the entry
-                    read_entry(&mut reader, &mut buf)?;
-                    return Ok(Some(buf));
-                } else {
-                    skip_entry(&mut reader)?;
-                }
+            if let Some(value) = segment.get(key, &mut buf)? {
+                return Ok(Some(value));
             }
         }
 
@@ -207,9 +229,7 @@ impl Database {
         buf.push_str(&format!("dirty segment:\n{dirty_buf:?}\n"));
 
         for (i, segment) in self.segments.iter_mut().enumerate() {
-            segment.seek(SeekFrom::Start(0))?;
-            dirty_buf.clear();
-            segment.read_to_end(&mut dirty_buf)?;
+            segment.dump(&mut dirty_buf)?;
             buf.push_str(&format!("segment {i}:\n{dirty_buf:?}\n"));
         }
 
