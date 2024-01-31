@@ -3,15 +3,15 @@
 mod error;
 
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, VecDeque},
     fs::File,
-    io::{self, BufReader, BufWriter, Read, Seek, SeekFrom, Write},
+    io::{self, BufReader, BufWriter, ErrorKind, Read, Seek, SeekFrom, Write},
     mem,
     path::{Path, PathBuf},
 };
 
 pub use error::Error;
-use tempfile::{tempfile, NamedTempFile};
+use tempfile::NamedTempFile;
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
@@ -25,10 +25,11 @@ pub struct Database {
     // An in memory `BTreeMap` of all the keys + their index in the current dirty segment
     memtable: BTreeMap<Vec<u8>, u64>,
     dirty: File,
-    segments: Vec<Segment>,
+    segments: VecDeque<Segment>,
 }
 
 struct Segment {
+    id: usize,
     file: File,
 }
 
@@ -60,7 +61,7 @@ impl Segment {
         Ok(None)
     }
 
-    pub fn merge(writer: File, new: &mut Self, old: &mut Self) -> io::Result<Self> {
+    pub fn merge(writer: impl Write, new: &mut Self, old: &mut Self) -> io::Result<()> {
         let mut new_segment = BufWriter::new(writer);
 
         new.file.seek(SeekFrom::Start(0))?;
@@ -85,11 +86,29 @@ impl Segment {
                     // skip the value
                     skip_entry(&mut old)?;
                     // update the key
-                    read_entry(&mut new, &mut old_key)?;
+                    match read_entry(&mut old, &mut old_key) {
+                        Ok(()) => (),
+                        Err(err) if err.kind() == ErrorKind::UnexpectedEof => {
+                            new_segment.write_all(&(new_key.len() as u32).to_be_bytes())?;
+                            new_segment.write_all(&new_key)?;
+                            io::copy(&mut new, &mut new_segment)?;
+                            break;
+                        }
+                        Err(e) => return Err(e),
+                    };
                 }
 
                 // read the next key in new_key
-                read_entry(&mut new, &mut new_key)?;
+                match read_entry(&mut new, &mut new_key) {
+                    Ok(()) => (),
+                    Err(err) if err.kind() == ErrorKind::UnexpectedEof => {
+                        new_segment.write_all(&(old_key.len() as u32).to_be_bytes())?;
+                        new_segment.write_all(&old_key)?;
+                        io::copy(&mut old, &mut new_segment)?;
+                        break;
+                    }
+                    Err(e) => return Err(e),
+                };
             } else {
                 new_segment.write_all(&(old_key.len() as u32).to_be_bytes())?;
                 new_segment.write_all(&old_key)?;
@@ -99,9 +118,19 @@ impl Segment {
                 io::copy(&mut old.by_ref().take(value_size as u64), &mut new_segment)?;
 
                 // read the next key in old_key
-                read_entry(&mut old, &mut old_key)?;
+                match read_entry(&mut old, &mut old_key) {
+                    Ok(()) => (),
+                    Err(err) if err.kind() == ErrorKind::UnexpectedEof => {
+                        new_segment.write_all(&(new_key.len() as u32).to_be_bytes())?;
+                        new_segment.write_all(&new_key)?;
+                        io::copy(&mut new, &mut new_segment)?;
+                        break;
+                    }
+                    Err(e) => return Err(e),
+                };
             }
         }
+        Ok(())
     }
 
     pub fn dump(&mut self, buf: &mut Vec<u8>) -> io::Result<()> {
@@ -129,7 +158,7 @@ impl Database {
             path: dir.to_owned(),
             memtable: Self::init_memtable(&mut dirty)?,
             dirty,
-            segments: Vec::new(),
+            segments: VecDeque::new(),
         })
     }
 
@@ -211,14 +240,29 @@ impl Database {
 
             // 2. Clean the dirty segment
             self.memtable.clear();
+            let next_id = self.segments.back().map_or(0, |segment| segment.id + 1);
             let new_segment = writer
                 .into_inner()
                 .unwrap()
-                .persist(self.path.join("segment-1"))?;
+                .persist(self.path.join(format!("segment-{next_id}")))?;
             self.dirty.set_len(0)?;
 
             // 3. Push the new file to the segment list
-            self.segments.push(Segment { file: new_segment });
+            self.segments.push_back(Segment {
+                id: next_id,
+                file: new_segment,
+            });
+
+            if self.segments.len() > 10 {
+                // merge the first two segments
+                let mut old = self.segments.pop_front().unwrap();
+                let mut new = self.segments.pop_front().unwrap();
+                let mut new_segment = NamedTempFile::new_in(&self.path)?;
+                Segment::merge(&mut new_segment, &mut new, &mut old)?;
+                let file = new_segment.persist(self.path.join(format!("segment-{}", old.id)))?;
+
+                self.segments.push_front(Segment { id: old.id, file });
+            }
         }
 
         Ok(())
