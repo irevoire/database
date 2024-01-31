@@ -60,6 +60,50 @@ impl Segment {
         Ok(None)
     }
 
+    pub fn merge(writer: File, new: &mut Self, old: &mut Self) -> io::Result<Self> {
+        let mut new_segment = BufWriter::new(writer);
+
+        new.file.seek(SeekFrom::Start(0))?;
+        old.file.seek(SeekFrom::Start(0))?;
+
+        let mut new = BufReader::new(&mut new.file);
+        let mut old = BufReader::new(&mut old.file);
+
+        let mut new_key = read_entry_to_vec(&mut new)?;
+        let mut old_key = read_entry_to_vec(&mut old)?;
+
+        loop {
+            if new_key <= old_key {
+                new_segment.write_all(&(new_key.len() as u32).to_be_bytes())?;
+                new_segment.write_all(&new_key)?;
+
+                let value_size = read_u32(&mut new)?;
+                new_segment.write_all(&value_size.to_be_bytes())?;
+                io::copy(&mut new.by_ref().take(value_size as u64), &mut new_segment)?;
+
+                if new_key == old_key {
+                    // skip the value
+                    skip_entry(&mut old)?;
+                    // update the key
+                    read_entry(&mut new, &mut old_key)?;
+                }
+
+                // read the next key in new_key
+                read_entry(&mut new, &mut new_key)?;
+            } else {
+                new_segment.write_all(&(old_key.len() as u32).to_be_bytes())?;
+                new_segment.write_all(&old_key)?;
+
+                let value_size = read_u32(&mut old)?;
+                new_segment.write_all(&value_size.to_be_bytes())?;
+                io::copy(&mut old.by_ref().take(value_size as u64), &mut new_segment)?;
+
+                // read the next key in old_key
+                read_entry(&mut old, &mut old_key)?;
+            }
+        }
+    }
+
     pub fn dump(&mut self, buf: &mut Vec<u8>) -> io::Result<()> {
         buf.clear();
         self.file.seek(SeekFrom::Start(0))?;
