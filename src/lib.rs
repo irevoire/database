@@ -221,49 +221,60 @@ impl Database {
         self.memtable.insert(key.to_vec(), pos);
 
         if self.memtable.len() > self.dirty_thresholds {
-            // We need to dump the dirty entries in a new segment
-
-            // 1. Get a tempfile that'll be droped if something happens during the dumping operation
-            let new_segment = NamedTempFile::new_in(&self.path)?;
-            let mut writer = BufWriter::new(new_segment);
-
-            // 1. Write all entries ordered by keys in a new file
-            for (key, value) in self.memtable.iter() {
-                self.dirty.seek(SeekFrom::Start(
-                    value + mem::size_of::<u32>() as u64 + key.len() as u64,
-                ))?;
-                let value = read_entry_to_vec(&mut self.dirty)?;
-
-                write_entry(&mut writer, key, &value)?;
-            }
-            writer.flush()?;
-
-            // 2. Clean the dirty segment
-            self.memtable.clear();
-            let next_id = self.segments.back().map_or(0, |segment| segment.id + 1);
-            let new_segment = writer
-                .into_inner()
-                .unwrap()
-                .persist(self.path.join(format!("segment-{next_id}")))?;
-            self.dirty.set_len(0)?;
-
-            // 3. Push the new file to the segment list
-            self.segments.push_back(Segment {
-                id: next_id,
-                file: new_segment,
-            });
-
-            if self.segments.len() > 10 {
-                // merge the first two segments
-                let mut old = self.segments.pop_front().unwrap();
-                let mut new = self.segments.pop_front().unwrap();
-                let mut new_segment = NamedTempFile::new_in(&self.path)?;
-                Segment::merge(&mut new_segment, &mut new, &mut old)?;
-                let file = new_segment.persist(self.path.join(format!("segment-{}", old.id)))?;
-
-                self.segments.push_front(Segment { id: old.id, file });
-            }
+            self.flush_dirty()?;
         }
+
+        Ok(())
+    }
+
+    pub fn flush_dirty(&mut self) -> Result<()> {
+        // We need to dump the dirty entries in a new segment
+
+        // 1. Get a tempfile that'll be droped if something happens during the dumping operation
+        let new_segment = NamedTempFile::new_in(&self.path)?;
+        let mut writer = BufWriter::new(new_segment);
+
+        // 1. Write all entries ordered by keys in a new file
+        for (key, value) in self.memtable.iter() {
+            self.dirty.seek(SeekFrom::Start(
+                value + mem::size_of::<u32>() as u64 + key.len() as u64,
+            ))?;
+            let value = read_entry_to_vec(&mut self.dirty)?;
+
+            write_entry(&mut writer, key, &value)?;
+        }
+        writer.flush()?;
+
+        // 2. Clean the dirty segment
+        self.memtable.clear();
+        let next_id = self.segments.back().map_or(0, |segment| segment.id + 1);
+        let new_segment = writer
+            .into_inner()
+            .unwrap()
+            .persist(self.path.join(format!("segment-{next_id}")))?;
+        self.dirty.set_len(0)?;
+
+        // 3. Push the new file to the segment list
+        self.segments.push_back(Segment {
+            id: next_id,
+            file: new_segment,
+        });
+
+        if self.segments.len() > 10 {
+            self.merge_segment()?;
+        }
+        Ok(())
+    }
+
+    pub fn merge_segment(&mut self) -> Result<()> {
+        // merge the first two segments
+        let mut old = self.segments.pop_front().unwrap();
+        let mut new = self.segments.pop_front().unwrap();
+        let mut new_segment = NamedTempFile::new_in(&self.path)?;
+        Segment::merge(&mut new_segment, &mut new, &mut old)?;
+        let file = new_segment.persist(self.path.join(format!("segment-{}", old.id)))?;
+
+        self.segments.push_front(Segment { id: old.id, file });
 
         Ok(())
     }
@@ -306,6 +317,7 @@ impl Database {
         Ok(())
     }
 
+    #[cfg(test)]
     fn dump(&mut self) -> io::Result<String> {
         let mut buf = String::new();
         buf.push_str(&format!("memtable:\n{:?}\n", self.memtable));
@@ -391,6 +403,81 @@ mod test {
         let v = database.get(b"hemlo").map_err(|e| println!("{e}")).unwrap();
         assert_eq!(v.as_deref(), None);
         assert_eq!(v.as_deref(), None);
+    }
+
+    #[test]
+    fn empty_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut database = Database::new(dir.path()).unwrap();
+
+        database.add(b"", b"riengue").unwrap();
+        insta::assert_display_snapshot!(database.dump().unwrap(), @r###"
+        memtable:
+        {[]: 0}
+        dirty segment:
+        [0, 0, 0, 0, 0, 0, 0, 7, 114, 105, 101, 110, 103, 117, 101]
+        "###);
+
+        let v = database.get(b"").map_err(|e| println!("{e}")).unwrap();
+        assert_eq!(v.as_deref(), Some(&b"riengue"[..]));
+    }
+
+    #[test]
+    fn empty_value() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut database = Database::new(dir.path()).unwrap();
+
+        database.add(b"riengue", b"").unwrap();
+        insta::assert_display_snapshot!(database.dump().unwrap(), @r###"
+        memtable:
+        {[114, 105, 101, 110, 103, 117, 101]: 0}
+        dirty segment:
+        [0, 0, 0, 7, 114, 105, 101, 110, 103, 117, 101, 0, 0, 0, 0]
+        "###);
+
+        let v = database
+            .get(b"riengue")
+            .map_err(|e| println!("{e}"))
+            .unwrap();
+        assert_eq!(v.as_deref(), Some(&b""[..]));
+    }
+
+    #[test]
+    fn merge() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut database = Database::new(dir.path()).unwrap();
+
+        // make a first segment
+        database.add(b"hello", b"world").unwrap();
+        database.add(b"tamo", b"kefir").unwrap();
+        database.add(b"a", b"b").unwrap();
+        database.flush_dirty().unwrap();
+
+        // make a second clean segment out of the memtable
+        database.add(b"hello", b"tamo").unwrap();
+        database.add(b"b", b"c").unwrap();
+        database.flush_dirty().unwrap();
+
+        insta::assert_display_snapshot!(database.dump().unwrap(), @r###"
+        memtable:
+        {}
+        dirty segment:
+        []
+        segment 0:
+        [0, 0, 0, 1, 97, 0, 0, 0, 1, 98, 0, 0, 0, 5, 104, 101, 108, 108, 111, 0, 0, 0, 5, 119, 111, 114, 108, 100, 0, 0, 0, 4, 116, 97, 109, 111, 0, 0, 0, 5, 107, 101, 102, 105, 114]
+        segment 1:
+        [0, 0, 0, 1, 98, 0, 0, 0, 1, 99, 0, 0, 0, 5, 104, 101, 108, 108, 111, 0, 0, 0, 4, 116, 97, 109, 111]
+        "###);
+
+        database.merge_segment().unwrap();
+        insta::assert_display_snapshot!(database.dump().unwrap(), @r###"
+        memtable:
+        {}
+        dirty segment:
+        []
+        segment 0:
+        [0, 0, 0, 1, 97, 0, 0, 0, 1, 98, 0, 0, 0, 1, 98, 0, 0, 0, 1, 99, 0, 0, 0, 5, 104, 101, 108, 108, 111, 0, 0, 0, 4, 116, 97, 109, 111, 0, 0, 0, 4, 116, 97, 109, 111, 0, 0, 0, 5, 107, 101, 102, 105, 114]
+        "###);
     }
 
     #[test]
